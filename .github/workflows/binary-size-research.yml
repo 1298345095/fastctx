@@ -1,0 +1,130 @@
+name: Binary size research
+
+# Isolated experiment on the research branch; never publishes a release.
+on:
+  push:
+    branches:
+      - 'research/binary-size-*'
+    paths:
+      - '.github/workflows/binary-size-research.yml'
+      - 'scripts/binary-size-research.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: binary-size-research-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ELF size / ${{ matrix.variant }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Baseline matches the workspace release profile: debug=line-tables-only,
+          # default no LTO, 16 codegen units, opt-level=3.
+          - variant: baseline
+            lto: 'false'
+            codegen_units: '16'
+            opt_level: '3'
+          - variant: thin
+            lto: 'thin'
+            codegen_units: '1'
+            opt_level: '3'
+          - variant: fat
+            lto: 'fat'
+            codegen_units: '1'
+            opt_level: '3'
+          - variant: thin-size
+            lto: 'thin'
+            codegen_units: '1'
+            opt_level: 's'
+    env:
+      FASTCTX_RELEASE: '1'
+      FASTCTX_THIRD_PARTY_LICENSES: ${{ github.workspace }}/dist/THIRD_PARTY_LICENSES.md
+      CARGO_PROFILE_RELEASE_LTO: ${{ matrix.lto }}
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: ${{ matrix.codegen_units }}
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: ${{ matrix.opt_level }}
+      CARGO_PROFILE_RELEASE_DEBUG: 'line-tables-only'
+      CARGO_PROFILE_RELEASE_STRIP: 'none'
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: binary-size-${{ matrix.variant }}
+      - name: Install the same Zig toolchain as the release
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install ziglang==0.14.1
+          cargo install --locked cargo-zigbuild --version 0.23.0
+          mkdir -p "$RUNNER_TEMP/zig-bin"
+          cat > "$RUNNER_TEMP/zig-bin/zig" <<'SH'
+          #!/bin/sh
+          exec python -m ziglang "$@"
+          SH
+          chmod +x "$RUNNER_TEMP/zig-bin/zig"
+          echo "$RUNNER_TEMP/zig-bin" >> "$GITHUB_PATH"
+      - name: Build fastctx with full symbols for attribution
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +1.92.0 zigbuild --locked --release \
+            -p fastctx --bin fastctx --target x86_64-unknown-linux-musl
+          target/x86_64-unknown-linux-musl/release/fastctx --version
+      - name: Verify bundled material and measure ELF and Rust symbols
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary=target/x86_64-unknown-linux-musl/release/fastctx
+          python scripts/package.py check-binary \
+            --target x86_64-unknown-linux-gnu \
+            --binary "$binary" --notices dist/THIRD_PARTY_LICENSES.md
+          python scripts/binary-size-research.py analyze \
+            --variant '${{ matrix.variant }}' \
+            --binary "$binary" \
+            --output 'reports/${{ matrix.variant }}'
+          cat 'reports/${{ matrix.variant }}/report.json' | python -c \
+            'import json,sys; r=json.load(sys.stdin); print("stripped bytes:",r["stripped_bytes"], "gzip bytes:",r["gzip6_bytes"])'
+      - name: Upload measurements (no executable binaries)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-size-${{ matrix.variant }}
+          path: reports/${{ matrix.variant }}/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  compare:
+    name: Compare all profiles
+    needs: build
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-size-*
+          path: downloaded
+          merge-multiple: false
+      - name: Build comparison table and job summary
+        run: python3 scripts/binary-size-research.py compare --reports downloaded --output results
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-size-comparison
+          path: results/
+          retention-days: 14
